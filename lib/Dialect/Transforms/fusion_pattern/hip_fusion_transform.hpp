@@ -30,6 +30,7 @@
 
 #include "hip/Dialect/IR/HipDialect.h"
 
+#include "matmul_nbits_group.hpp"
 #include "matmul_nbits_shared_act.hpp"
 #include "patch_embed_conv_to_gemm.hpp"
 
@@ -831,8 +832,11 @@ inline void registerNativeHelpers(mlir::PDLPatternModule &pdlPatterns) {
 /// declines -- which is the whole reason QConvFusion roots at `hip.conv`
 /// rather than at the `hip.quantize_linear` it replaces.
 constexpr unsigned kPatchEmbedConvToGemmBenefit = 5;
-/// No other pattern roots at `hip.matmul_nbits`.
+/// The grouping pattern only matches projections that already carry the
+/// `quantized(...)` operands the shared-activation pattern adds, so the two
+/// never compete for the same root.
 constexpr unsigned kMatMulNBitsSharedActivationBenefit = 1;
+constexpr unsigned kMatMulNBitsGroupBenefit = 1;
 
 /// apply this directory's patterns to every function body in module, failure
 /// means the embedded PDLL patterns will not parse or the driver failed
@@ -849,6 +853,8 @@ inline mlir::LogicalResult run(mlir::ModuleOp module,
       patterns, mlir::PatternBenefit(kPatchEmbedConvToGemmBenefit));
   populateMatMulNBitsSharedActivationPatterns(
       patterns, mlir::PatternBenefit(kMatMulNBitsSharedActivationBenefit));
+  populateMatMulNBitsGroupPatterns(
+      patterns, mlir::PatternBenefit(kMatMulNBitsGroupBenefit));
 
   // pdl patterns here
   if (pdlBuffer.getBufferSize() != 0) {
