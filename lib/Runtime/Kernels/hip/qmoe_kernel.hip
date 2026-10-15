@@ -1304,7 +1304,11 @@ static void qmoe_tune_record(
   QmoeTuneState& st = states[key];
   if (st.done || sample_idx != st.cursor)
     return;  // stale sample (shape raced to done)
-  if (st.rounds >= kQmoeWarmupRounds) {
+  // Windows HIP event timing can occasionally return a non-positive value
+  // for sub-millisecond kernels. Such a reading is timer noise, not a real
+  // duration, and must never make that candidate win the tune. Keep advancing
+  // the candidate sequence so kernel numerics remain identical.
+  if (st.rounds >= kQmoeWarmupRounds && ms > 0.0f) {
     st.ms[sample_idx] += ms;
     st.n[sample_idx] += 1;
   }
