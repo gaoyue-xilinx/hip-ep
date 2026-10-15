@@ -5,6 +5,8 @@
 
 #include "HipToLLVMUtils.h"
 
+#include "mlir/IR/Matchers.h"
+
 namespace mlir {
 namespace hip {
 namespace {
@@ -33,6 +35,16 @@ struct QMoEOpLowering : public ConvertOpToLLVMPattern<QMoEOp> {
     auto createF32Const = [&](float value) -> Value {
       return LLVM::ConstantOp::create(rewriter, loc, f32Type,
                                       rewriter.getF32FloatAttr(value));
+    };
+
+    auto getDiskConstantIndex = [&](Value value) -> std::optional<int64_t> {
+      auto getConst = value.getDefiningOp<GetConstantOp>();
+      if (!getConst || !getConst->hasAttr("hip.disk_resident"))
+        return std::nullopt;
+      llvm::APInt index;
+      if (!matchPattern(getConst.getIndex(), m_ConstantInt(&index)))
+        return std::nullopt;
+      return index.getSExtValue();
     };
 
     Value statePtr = adaptor.getHandle();
@@ -68,6 +80,30 @@ struct QMoEOpLowering : public ConvertOpToLLVMPattern<QMoEOp> {
         extractOptionalMemRefPtr(adaptor.getRouterWeights(), rewriter, loc);
     Value outputPtr =
         extractContiguousMemRefPtr(adaptor.getOutput(), rewriter, loc);
+
+    std::optional<int64_t> fc1WeightsDiskIndex =
+        getDiskConstantIndex(op.getFc1ExpertsWeights());
+    std::optional<int64_t> fc1ScalesDiskIndex =
+        getDiskConstantIndex(op.getFc1Scales());
+    std::optional<int64_t> fc2WeightsDiskIndex =
+        getDiskConstantIndex(op.getFc2ExpertsWeights());
+    std::optional<int64_t> fc2ScalesDiskIndex =
+        getDiskConstantIndex(op.getFc2Scales());
+    bool diskResidentExperts = fc1WeightsDiskIndex || fc1ScalesDiskIndex ||
+                               fc2WeightsDiskIndex || fc2ScalesDiskIndex;
+    if (diskResidentExperts &&
+        !(fc1WeightsDiskIndex && fc1ScalesDiskIndex && fc2WeightsDiskIndex &&
+          fc2ScalesDiskIndex)) {
+      return rewriter.notifyMatchFailure(
+          op, "disk-resident QMoE requires all four expert weight/scale "
+              "tables to be disk-resident");
+    }
+    if (diskResidentExperts) {
+      fc1WeightsPtr = createI64Const(*fc1WeightsDiskIndex);
+      fc1ScalesPtr = createI64Const(*fc1ScalesDiskIndex);
+      fc2WeightsPtr = createI64Const(*fc2WeightsDiskIndex);
+      fc2ScalesPtr = createI64Const(*fc2ScalesDiskIndex);
+    }
 
     auto inputType = cast<MemRefType>(op.getInput().getType());
     auto routerType = cast<MemRefType>(op.getRouterProbs().getType());
@@ -158,9 +194,17 @@ struct QMoEOpLowering : public ConvertOpToLLVMPattern<QMoEOp> {
         i64Type, // normalize_routing_weights
         i64Type  // elem_size
     };
+    if (diskResidentExperts) {
+      paramTypes[4] = i64Type;
+      paramTypes[5] = i64Type;
+      paramTypes[7] = i64Type;
+      paramTypes[8] = i64Type;
+    }
 
     FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
-        rewriter, module, kWrapQMoE, paramTypes, i32Type);
+        rewriter, module,
+        diskResidentExperts ? kWrapQMoEFromFile : kWrapQMoE, paramTypes,
+        i32Type);
     if (failed(funcOp)) {
       return failure();
     }

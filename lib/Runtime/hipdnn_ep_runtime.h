@@ -350,6 +350,14 @@ int hipdnn_ep_state_ensure_qmoe_scratch(RuntimeState *state,
 void *hipdnn_ep_state_get_qmoe_host_scratch(RuntimeState *state);
 int hipdnn_ep_state_ensure_qmoe_host_scratch(RuntimeState *state,
                                              size_t needed_size);
+void *hipdnn_ep_state_get_qmoe_expert_cache(RuntimeState *state);
+void hipdnn_ep_state_set_qmoe_expert_cache(RuntimeState *state, void *cache);
+void hipdnn_ep_qmoe_expert_cache_destroy(void *cache);
+void hipdnn_ep_state_set_qmoe_precomputed_routes(RuntimeState *state,
+                                                 void *indices,
+                                                 void *weights);
+void *hipdnn_ep_state_get_qmoe_precomputed_indices(RuntimeState *state);
+void *hipdnn_ep_state_get_qmoe_precomputed_weights(RuntimeState *state);
 
 // Per-session scratch for wrap_qmoe_amd (com.amd QMoE / LatentMoE)
 // transient buffers. Independent from the qmoe_scratch pair
@@ -584,6 +592,11 @@ typedef struct {
 // Returns: GPU pointer (NULL if index out of range or state invalid)
 // Ownership: Caller does NOT own pointer (freed in state_cleanup)
 void *hipdnn_ep_constant_get(RuntimeState *state, int64_t index);
+
+// Get the read-only host mapping for a disk-resident constant. Returns NULL
+// for a non-disk constant or invalid index. The mapping is owned by the state.
+const void *hipdnn_ep_disk_constant_get(RuntimeState *state, int64_t index,
+                                        size_t *size_bytes);
 
 //===----------------------------------------------------------------------===//
 // Tensor Preparation Helpers (allocation-strategy agnostic)
@@ -1555,6 +1568,25 @@ int wrap_qmoe(
     int64_t num_experts, int64_t k, int64_t expert_weight_bits,
     int64_t block_size, int64_t swiglu_fusion,
     int64_t activation_type, // 0=relu,1=gelu,2=silu,3=swiglu,4=identity
+    float activation_alpha, float activation_beta, float swiglu_limit,
+    int64_t normalize_routing_weights, int64_t elem_size);
+
+// Disk-streamed QMoE variant. The four large expert weight/scale tables stay
+// file-backed and are copied into reusable GPU workspace immediately before
+// the QMoE kernels execute. Biases and optional tensors remain normal GPU
+// pointers. This is a correctness-first out-of-core path; active-expert-only
+// paging can optimize the transfer volume without changing this ABI.
+int wrap_qmoe_from_file(
+    RuntimeState *state, const void *input, const void *router_probs,
+    const void *router_weights, int64_t fc1_weights_index,
+    int64_t fc1_scales_index, const void *fc1_bias,
+    int64_t fc2_weights_index, int64_t fc2_scales_index,
+    const void *fc2_bias, const void *fc3_weights, const void *fc3_scales,
+    const void *fc3_bias, const void *fc1_zero_points,
+    const void *fc2_zero_points, const void *fc3_zero_points, void *output,
+    int64_t num_tokens, int64_t hidden_size, int64_t inter_size,
+    int64_t num_experts, int64_t k, int64_t expert_weight_bits,
+    int64_t block_size, int64_t swiglu_fusion, int64_t activation_type,
     float activation_alpha, float activation_beta, float swiglu_limit,
     int64_t normalize_routing_weights, int64_t elem_size);
 

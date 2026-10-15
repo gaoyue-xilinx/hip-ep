@@ -129,6 +129,12 @@ struct RuntimeState {
   size_t qmoe_scratch_size;
   void *qmoe_host_scratch; // pinned host mirror for D2H of expert idx/weights
   size_t qmoe_host_scratch_size;
+  // Opaque per-session cache for disk-resident QMoE expert slices. The real
+  // runtime owns the concrete C++ type; keeping it opaque here avoids leaking
+  // STL types into RuntimeState's C-facing layout.
+  void *qmoe_expert_cache;
+  void *qmoe_precomputed_indices;
+  void *qmoe_precomputed_weights;
 
   // Per-session scratch for wrap_qmoe_amd (com.amd QMoE / LatentMoE)
   // transient buffers. Deliberately a SEPARATE field from

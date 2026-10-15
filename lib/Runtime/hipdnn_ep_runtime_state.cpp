@@ -368,6 +368,9 @@ static int initialize_state_handles(RuntimeState **out_state) {
   state->qmoe_scratch_size = 0;
   state->qmoe_host_scratch = nullptr;
   state->qmoe_host_scratch_size = 0;
+  state->qmoe_expert_cache = nullptr;
+  state->qmoe_precomputed_indices = nullptr;
+  state->qmoe_precomputed_weights = nullptr;
   state->qmoe_amd_scratch = nullptr;
   state->qmoe_amd_scratch_size = 0;
   state->qmoe_amd_host_scratch = nullptr;
@@ -963,6 +966,10 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
   if (state->qmoe_host_scratch) {
     HIP_CLEANUP(hipHostFree(state->qmoe_host_scratch));
   }
+#if defined(HIPDNN_EP_REAL_RUNTIME)
+  hipdnn_ep_qmoe_expert_cache_destroy(state->qmoe_expert_cache);
+#endif
+  state->qmoe_expert_cache = nullptr;
 
   // Free com.amd qmoe device scratch + pinned host mirror (if allocated)
   if (state->qmoe_amd_scratch) {
@@ -1140,6 +1147,29 @@ void *hipdnn_ep_constant_get(RuntimeState *state, int64_t index) {
     return nullptr;
   }
   return state->gpu_constants[index];
+}
+
+const void *hipdnn_ep_disk_constant_get(RuntimeState *state, int64_t index,
+                                        size_t *size_bytes) {
+  if (size_bytes)
+    *size_bytes = 0;
+  if (!state || index < 0 || (size_t)index >= state->num_constants ||
+      !state->disk_constants) {
+    fprintf(stderr,
+            "hipdnn_ep_disk_constant_get: invalid state or index %lld\n",
+            (long long)index);
+    return nullptr;
+  }
+  const DiskConstant &constant = state->disk_constants[index];
+  if (!constant.data || constant.size < 0) {
+    fprintf(stderr,
+            "hipdnn_ep_disk_constant_get: constant %lld is not disk-resident\n",
+            (long long)index);
+    return nullptr;
+  }
+  if (size_bytes)
+    *size_bytes = static_cast<size_t>(constant.size);
+  return constant.data;
 }
 
 static int ensure_disk_gather_staging(RuntimeState *state, size_t size) {
@@ -1715,6 +1745,32 @@ int hipdnn_ep_state_ensure_qmoe_host_scratch(RuntimeState *state,
   }
   state->qmoe_host_scratch_size = alloc_size;
   return 0;
+}
+
+void *hipdnn_ep_state_get_qmoe_expert_cache(RuntimeState *state) {
+  return state ? state->qmoe_expert_cache : nullptr;
+}
+
+void hipdnn_ep_state_set_qmoe_expert_cache(RuntimeState *state, void *cache) {
+  if (state)
+    state->qmoe_expert_cache = cache;
+}
+
+void hipdnn_ep_state_set_qmoe_precomputed_routes(RuntimeState *state,
+                                                 void *indices,
+                                                 void *weights) {
+  if (!state)
+    return;
+  state->qmoe_precomputed_indices = indices;
+  state->qmoe_precomputed_weights = weights;
+}
+
+void *hipdnn_ep_state_get_qmoe_precomputed_indices(RuntimeState *state) {
+  return state ? state->qmoe_precomputed_indices : nullptr;
+}
+
+void *hipdnn_ep_state_get_qmoe_precomputed_weights(RuntimeState *state) {
+  return state ? state->qmoe_precomputed_weights : nullptr;
 }
 
 //===----------------------------------------------------------------------===//

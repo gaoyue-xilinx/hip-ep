@@ -484,29 +484,38 @@ struct GetConstantOpLowering : public ConvertOpToLLVMPattern<GetConstantOp> {
     Type i64Type = IntegerType::get(rewriter.getContext(), 64);
     MemRefType memRefType = op.getResult().getType();
 
-    SmallVector<Type, 2> paramTypes = {ptrType, i64Type};
-
-    FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
-        rewriter, module, kHipGetConstant, paramTypes, ptrType);
-    if (failed(funcOp))
-      return failure();
-
-    SmallVector<Value, 2> args = {adaptor.getCtx(), adaptor.getIndex()};
-    auto callOp = LLVM::CallOp::create(rewriter, loc, *funcOp, args);
-
-    // The runtime always returns a generic pointer (AS 0).  Cast to the
-    // memref's address space (e.g. AS 1 = AMDGPU global memory) if needed.
     FailureOr<unsigned> addrSpace =
         getTypeConverter()->getMemRefAddressSpace(memRefType);
     if (failed(addrSpace))
       return failure();
 
-    Value dataPtr = callOp.getResult();
-    if (*addrSpace != 0)
-      dataPtr = LLVM::AddrSpaceCastOp::create(
-          rewriter, loc,
-          LLVM::LLVMPointerType::get(rewriter.getContext(), *addrSpace),
-          dataPtr);
+    Type dataPtrType =
+        LLVM::LLVMPointerType::get(rewriter.getContext(), *addrSpace);
+    Value dataPtr;
+    if (op->hasAttr("hip.disk_resident")) {
+      // Disk-resident constants are consumed by specialized operations using
+      // their constant index.  They intentionally have no permanent GPU
+      // allocation, so materialize a null descriptor instead of calling the
+      // normal constants-blob accessor.  The specialized lowering ignores
+      // this descriptor pointer and forwards the index to the runtime.
+      dataPtr = LLVM::ZeroOp::create(rewriter, loc, dataPtrType);
+    } else {
+      SmallVector<Type, 2> paramTypes = {ptrType, i64Type};
+      FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
+          rewriter, module, kHipGetConstant, paramTypes, ptrType);
+      if (failed(funcOp))
+        return failure();
+
+      SmallVector<Value, 2> args = {adaptor.getCtx(), adaptor.getIndex()};
+      auto callOp = LLVM::CallOp::create(rewriter, loc, *funcOp, args);
+
+      // The runtime always returns a generic pointer (AS 0).  Cast to the
+      // memref's address space (e.g. AS 1 = AMDGPU global memory) if needed.
+      dataPtr = callOp.getResult();
+      if (*addrSpace != 0)
+        dataPtr = LLVM::AddrSpaceCastOp::create(rewriter, loc, dataPtrType,
+                                                dataPtr);
+    }
 
     auto shape = memRefType.getShape();
     SmallVector<Value, 4> sizes;

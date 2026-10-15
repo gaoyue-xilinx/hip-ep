@@ -12,9 +12,549 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #define HIP_CHECK(cmd) HIP_CHECK_GOTO(cmd, cleanup)
+
+namespace {
+
+struct QMoEExpertCacheEntry {
+  int64_t indices[4] = {};
+  void *device_base = nullptr;
+  size_t total_size = 0;
+  size_t capacity = 0;
+  size_t table_offsets[4] = {};
+  std::vector<int32_t> expert_for_slot;
+  std::vector<size_t> last_used;
+  std::vector<size_t> use_count;
+  size_t tick = 0;
+};
+
+struct QMoEExpertCache {
+  size_t budget_bytes = 0;
+  size_t allocated_bytes = 0;
+  bool allocation_failed = false;
+  std::vector<QMoEExpertCacheEntry> entries;
+};
+
+static size_t qmoe_expert_cache_budget() {
+  const char *value = std::getenv("HIPDNN_EP_QMOE_EXPERT_CACHE_MIB");
+  if (!value || !*value)
+    return 0;
+  char *end = nullptr;
+  const unsigned long long mib = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || mib > SIZE_MAX / (1024ull * 1024ull))
+    return 0;
+  return static_cast<size_t>(mib) * 1024ull * 1024ull;
+}
+
+static size_t qmoe_expert_cache_slots() {
+  const char *value = std::getenv("HIPDNN_EP_QMOE_EXPERT_CACHE_SLOTS");
+  if (!value || !*value)
+    return 24;
+  char *end = nullptr;
+  const unsigned long long slots = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || slots == 0 || slots > SIZE_MAX)
+    return 24;
+  return static_cast<size_t>(slots);
+}
+
+static QMoEExpertCache *get_qmoe_expert_cache(RuntimeState *state) {
+  auto *cache = static_cast<QMoEExpertCache *>(
+      hipdnn_ep_state_get_qmoe_expert_cache(state));
+  if (cache)
+    return cache;
+  const size_t budget = qmoe_expert_cache_budget();
+  if (budget == 0)
+    return nullptr;
+  cache = new QMoEExpertCache();
+  cache->budget_bytes = budget;
+  hipdnn_ep_state_set_qmoe_expert_cache(state, cache);
+  return cache;
+}
+
+static QMoEExpertCacheEntry *find_or_create_cache_entry(
+    RuntimeState *state, const int64_t indices[4], const size_t expert_sizes[4],
+    int64_t num_experts, int64_t minimum_slots) {
+  QMoEExpertCache *cache = get_qmoe_expert_cache(state);
+  if (!cache)
+    return nullptr;
+  for (auto &entry : cache->entries) {
+    if (entry.indices[0] == indices[0] && entry.indices[1] == indices[1] &&
+        entry.indices[2] == indices[2] && entry.indices[3] == indices[3])
+      return &entry;
+  }
+  if (cache->allocation_failed || minimum_slots <= 0)
+    return nullptr;
+
+  constexpr size_t kTableAlignment = 256;
+  const size_t min_capacity = static_cast<size_t>(minimum_slots);
+  size_t capacity = std::min(static_cast<size_t>(num_experts),
+                             std::max(min_capacity, qmoe_expert_cache_slots()));
+  size_t table_offsets[4] = {};
+  size_t total_size = 0;
+  auto compute_layout = [&](size_t slots) {
+    total_size = 0;
+    for (int i = 0; i < 4; ++i) {
+      total_size = (total_size + kTableAlignment - 1) &
+                   ~(kTableAlignment - 1);
+      table_offsets[i] = total_size;
+      if (expert_sizes[i] > SIZE_MAX / slots)
+        return false;
+      const size_t bytes = expert_sizes[i] * slots;
+      if (bytes > SIZE_MAX - total_size)
+        return false;
+      total_size += bytes;
+    }
+    return true;
+  };
+  while (capacity >= min_capacity) {
+    if (compute_layout(capacity) && total_size <= cache->budget_bytes &&
+        cache->allocated_bytes <= cache->budget_bytes - total_size)
+      break;
+    --capacity;
+  }
+  if (capacity < min_capacity)
+    return nullptr;
+
+  void *device_base = nullptr;
+  if (hipMalloc(&device_base, total_size) != hipSuccess) {
+    cache->allocation_failed = true;
+    RUNTIME_DEBUG_LOG(
+        "[REAL] QMoE expert cache allocation stopped at %zu bytes\n",
+        cache->allocated_bytes);
+    return nullptr;
+  }
+  QMoEExpertCacheEntry entry;
+  for (int i = 0; i < 4; ++i)
+    entry.indices[i] = indices[i];
+  entry.device_base = device_base;
+  entry.total_size = total_size;
+  entry.capacity = capacity;
+  for (int i = 0; i < 4; ++i)
+    entry.table_offsets[i] = table_offsets[i];
+  entry.expert_for_slot.resize(capacity, -1);
+  entry.last_used.resize(capacity, 0);
+  entry.use_count.resize(capacity, 0);
+  cache->allocated_bytes += total_size;
+  cache->entries.push_back(std::move(entry));
+  RUNTIME_DEBUG_LOG(
+      "[REAL] QMoE expert cache allocated layer %zu: %zu slots, %zu bytes "
+      "(%zu/%zu total)\n",
+      cache->entries.size(), capacity, total_size, cache->allocated_bytes,
+      cache->budget_bytes);
+  return &cache->entries.back();
+}
+
+} // namespace
+
+void hipdnn_ep_qmoe_expert_cache_destroy(void *opaque_cache) {
+  auto *cache = static_cast<QMoEExpertCache *>(opaque_cache);
+  if (!cache)
+    return;
+  for (auto &entry : cache->entries) {
+    if (entry.device_base)
+      hipFree(entry.device_base);
+  }
+  delete cache;
+}
+
+int wrap_qmoe_from_file(
+    RuntimeState *state, const void *input, const void *router_probs,
+    const void *router_weights, int64_t fc1_weights_index,
+    int64_t fc1_scales_index, const void *fc1_bias,
+    int64_t fc2_weights_index, int64_t fc2_scales_index,
+    const void *fc2_bias, const void *fc3_weights, const void *fc3_scales,
+    const void *fc3_bias, const void *fc1_zero_points,
+    const void *fc2_zero_points, const void *fc3_zero_points, void *output,
+    int64_t num_tokens, int64_t hidden_size, int64_t inter_size,
+    int64_t num_experts, int64_t k, int64_t expert_weight_bits,
+    int64_t block_size, int64_t swiglu_fusion, int64_t activation_type,
+    float activation_alpha, float activation_beta, float swiglu_limit,
+    int64_t normalize_routing_weights, int64_t elem_size) {
+  if (!state) {
+    fprintf(stderr, "wrap_qmoe_from_file: null state\n");
+    return -1;
+  }
+
+  const int64_t indices[4] = {fc1_weights_index, fc1_scales_index,
+                              fc2_weights_index, fc2_scales_index};
+  const void *host_tables[4] = {};
+  size_t table_sizes[4] = {};
+  size_t table_offsets[4] = {};
+  size_t total_size = 0;
+  constexpr size_t kTableAlignment = 256;
+  for (int i = 0; i < 4; ++i) {
+    host_tables[i] =
+        hipdnn_ep_disk_constant_get(state, indices[i], &table_sizes[i]);
+    if (!host_tables[i] || table_sizes[i] == 0) {
+      fprintf(stderr,
+              "wrap_qmoe_from_file: failed to access disk constant %lld\n",
+              (long long)indices[i]);
+      return -1;
+    }
+    if (total_size > SIZE_MAX - (kTableAlignment - 1)) {
+      fprintf(stderr, "wrap_qmoe_from_file: table layout overflow\n");
+      return -1;
+    }
+    total_size = (total_size + kTableAlignment - 1) &
+                 ~(kTableAlignment - 1);
+    table_offsets[i] = total_size;
+    if (table_sizes[i] > SIZE_MAX - total_size) {
+      fprintf(stderr, "wrap_qmoe_from_file: table size overflow\n");
+      return -1;
+    }
+    total_size += table_sizes[i];
+  }
+
+  auto stream =
+      static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state));
+  if (!stream) {
+    fprintf(stderr, "wrap_qmoe_from_file: missing stream\n");
+    return -1;
+  }
+
+  size_t expert_sizes[4] = {};
+  size_t bytes_per_active_expert = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (table_sizes[i] % static_cast<size_t>(num_experts) != 0) {
+      fprintf(stderr,
+              "wrap_qmoe_from_file: constant %lld size %zu is not divisible "
+              "by %lld experts\n",
+              (long long)indices[i], table_sizes[i], (long long)num_experts);
+      return -1;
+    }
+    expert_sizes[i] = table_sizes[i] / static_cast<size_t>(num_experts);
+    if (expert_sizes[i] > SIZE_MAX - bytes_per_active_expert) {
+      fprintf(stderr, "wrap_qmoe_from_file: expert staging size overflow\n");
+      return -1;
+    }
+    bytes_per_active_expert += expert_sizes[i];
+  }
+
+  // The persistent cache is decode-only. Prefill touches many experts and is
+  // better served by the transient sparse streaming path.
+  QMoEExpertCacheEntry *cache_entry =
+      num_tokens == 1
+          ? find_or_create_cache_entry(state, indices, expert_sizes,
+                                       num_experts, k)
+          : nullptr;
+
+  // Route first so file-backed tables only upload expert slices used by this
+  // invocation. The regular wrapper repeats this inexpensive deterministic
+  // routing launch after the copies, keeping its public ABI unchanged.
+  const size_t routed_count = static_cast<size_t>(num_tokens * k);
+  const size_t route_indices_bytes = routed_count * sizeof(int32_t);
+  const size_t route_weights_offset =
+      (route_indices_bytes + 63) & ~size_t(63);
+  const size_t route_scratch_bytes = route_weights_offset + routed_count * elem_size;
+  // Decode later reuses these routing buffers inside wrap_qmoe. Reserve a
+  // conservative floor before routing so wrap_qmoe's full scratch layout does
+  // not grow the allocation and invalidate the pointers. Typical decode uses
+  // well under 1 MiB; 16 MiB also covers much larger hidden/inter sizes.
+  const size_t route_allocation_bytes =
+      num_tokens == 1 ? std::max(route_scratch_bytes, size_t(16) << 20)
+                      : route_scratch_bytes;
+  if (hipdnn_ep_state_ensure_qmoe_scratch(state, route_allocation_bytes) != 0) {
+    fprintf(stderr, "wrap_qmoe_from_file: unable to allocate routing scratch\n");
+    return -1;
+  }
+  auto *route_scratch =
+      static_cast<uint8_t *>(hipdnn_ep_state_get_qmoe_scratch(state));
+  void *route_indices = route_scratch;
+  void *route_weights = route_scratch + route_weights_offset;
+  if (hip_qmoe_topk_routing(stream, router_probs, route_indices, route_weights,
+                            num_tokens, num_experts, k,
+                            normalize_routing_weights, elem_size) != 0) {
+    fprintf(stderr, "wrap_qmoe_from_file: top-k routing failed\n");
+    return -1;
+  }
+
+  // Decode copies expert slices through pinned staging. Pageable file mappings
+  // make hipMemcpyAsync stage every small expert copy internally; explicitly
+  // packing the 8 active experts into one reusable pinned allocation makes the
+  // H2D copies genuinely asynchronous. The routing D2H sync at the start of
+  // the next layer guarantees this staging is no longer in flight before the
+  // CPU reuses it.
+  const bool use_pinned_staging = num_tokens == 1;
+  uint8_t *host_scratch = nullptr;
+  size_t packed_offset = (route_indices_bytes + 63) & ~size_t(63);
+  if (use_pinned_staging) {
+    if (routed_count > SIZE_MAX / bytes_per_active_expert ||
+        packed_offset >
+            SIZE_MAX - routed_count * bytes_per_active_expert) {
+      fprintf(stderr, "wrap_qmoe_from_file: pinned staging size overflow\n");
+      return -1;
+    }
+    const size_t pinned_bytes =
+        packed_offset + routed_count * bytes_per_active_expert;
+    if (hipdnn_ep_state_ensure_qmoe_host_scratch(state, pinned_bytes) != 0) {
+      fprintf(stderr,
+              "wrap_qmoe_from_file: unable to allocate pinned expert staging\n");
+      return -1;
+    }
+    host_scratch = static_cast<uint8_t *>(
+        hipdnn_ep_state_get_qmoe_host_scratch(state));
+  }
+
+  std::vector<int32_t> pageable_active_experts;
+  int32_t *active_data = nullptr;
+  if (use_pinned_staging) {
+    active_data = reinterpret_cast<int32_t *>(host_scratch);
+  } else {
+    pageable_active_experts.resize(routed_count);
+    active_data = pageable_active_experts.data();
+  }
+  hipError_t status = hipMemcpyAsync(active_data, route_indices,
+                                     route_indices_bytes,
+                                     hipMemcpyDeviceToHost, stream);
+  if (status != hipSuccess || hipStreamSynchronize(stream) != hipSuccess) {
+    fprintf(stderr, "wrap_qmoe_from_file: unable to read active experts\n");
+    return -1;
+  }
+  std::vector<int32_t> active_experts(active_data,
+                                      active_data + routed_count);
+  std::sort(active_experts.begin(), active_experts.end());
+  active_experts.erase(
+      std::unique(active_experts.begin(), active_experts.end()),
+      active_experts.end());
+
+  // Decode always remaps the selected experts into compact slots. Without a
+  // cache the slots are [0, active_experts); with a cache they address a small
+  // per-layer LRU allocation. This avoids the old cache's full num_experts
+  // sparse allocation while retaining already-uploaded expert slices.
+  const bool compact_decode = num_tokens == 1;
+  size_t device_table_offsets[4] = {};
+  size_t device_total_size = 0;
+  for (int i = 0; i < 4; ++i) {
+    device_total_size =
+        (device_total_size + kTableAlignment - 1) & ~(kTableAlignment - 1);
+    device_table_offsets[i] = device_total_size;
+    const size_t device_table_size = compact_decode
+                                         ? active_experts.size() * expert_sizes[i]
+                                         : table_sizes[i];
+    if (device_table_size > SIZE_MAX - device_total_size) {
+      fprintf(stderr, "wrap_qmoe_from_file: compact table overflow\n");
+      return -1;
+    }
+    device_total_size += device_table_size;
+  }
+
+  uint8_t *device_base = nullptr;
+  if (cache_entry) {
+    device_base = static_cast<uint8_t *>(cache_entry->device_base);
+    device_total_size = cache_entry->total_size;
+    for (int i = 0; i < 4; ++i)
+      device_table_offsets[i] = cache_entry->table_offsets[i];
+  } else {
+    if (hipdnn_ep_state_ensure_workspace(state, device_total_size) != 0) {
+      fprintf(stderr,
+              "wrap_qmoe_from_file: unable to allocate %zu-byte GPU staging "
+              "buffer\n",
+              device_total_size);
+      return -1;
+    }
+    device_base =
+        static_cast<uint8_t *>(hipdnn_ep_state_get_workspace(state));
+  }
+  if (!device_base) {
+    fprintf(stderr, "wrap_qmoe_from_file: missing device staging\n");
+    return -1;
+  }
+  void *device_tables[4] = {};
+  for (int i = 0; i < 4; ++i)
+    device_tables[i] = device_base + device_table_offsets[i];
+
+  size_t streamed_bytes = 0;
+  size_t packed_cursor = packed_offset;
+  size_t cache_hits = 0;
+  std::vector<int32_t> active_slots(active_experts.size(), -1);
+  std::vector<int32_t> miss_experts;
+  std::vector<int32_t> miss_slots;
+  if (compact_decode) {
+    for (size_t active = 0; active < active_experts.size(); ++active) {
+      const int32_t expert = active_experts[active];
+      if (expert < 0 || expert >= num_experts) {
+        fprintf(stderr,
+                "wrap_qmoe_from_file: invalid routed expert %d of %lld\n",
+                expert, (long long)num_experts);
+        return -1;
+      }
+      int32_t slot = -1;
+      if (cache_entry) {
+        for (size_t candidate = 0; candidate < cache_entry->capacity;
+             ++candidate) {
+          if (cache_entry->expert_for_slot[candidate] == expert) {
+            slot = static_cast<int32_t>(candidate);
+            break;
+          }
+        }
+        if (slot >= 0) {
+          ++cache_hits;
+        } else {
+          for (size_t candidate = 0; candidate < cache_entry->capacity;
+               ++candidate) {
+            if (cache_entry->expert_for_slot[candidate] == -1) {
+              slot = static_cast<int32_t>(candidate);
+              break;
+            }
+          }
+          if (slot < 0) {
+            size_t least_used = SIZE_MAX;
+            size_t oldest = SIZE_MAX;
+            for (size_t candidate = 0; candidate < cache_entry->capacity;
+                 ++candidate) {
+              const int32_t resident =
+                  cache_entry->expert_for_slot[candidate];
+              if (std::binary_search(active_experts.begin(),
+                                     active_experts.end(), resident))
+                continue;
+              const size_t candidate_use = cache_entry->use_count[candidate];
+              const size_t candidate_age = cache_entry->last_used[candidate];
+              if (slot < 0 || candidate_use < least_used ||
+                  (candidate_use == least_used && candidate_age < oldest)) {
+                slot = static_cast<int32_t>(candidate);
+                least_used = candidate_use;
+                oldest = candidate_age;
+              }
+            }
+          }
+          if (slot < 0) {
+            fprintf(stderr, "wrap_qmoe_from_file: no evictable cache slot\n");
+            return -1;
+          }
+          cache_entry->expert_for_slot[static_cast<size_t>(slot)] = expert;
+          cache_entry->use_count[static_cast<size_t>(slot)] = 0;
+          miss_experts.push_back(expert);
+          miss_slots.push_back(slot);
+        }
+        ++cache_entry->use_count[static_cast<size_t>(slot)];
+        cache_entry->last_used[static_cast<size_t>(slot)] =
+            ++cache_entry->tick;
+      } else {
+        slot = static_cast<int32_t>(active);
+        miss_experts.push_back(expert);
+        miss_slots.push_back(slot);
+      }
+      active_slots[active] = slot;
+    }
+
+    for (size_t j = 0; j < routed_count; ++j) {
+      auto it = std::lower_bound(active_experts.begin(), active_experts.end(),
+                                 active_data[j]);
+      if (it == active_experts.end() || *it != active_data[j]) {
+        fprintf(stderr, "wrap_qmoe_from_file: route remap failed\n");
+        return -1;
+      }
+      active_data[j] = active_slots[static_cast<size_t>(
+          it - active_experts.begin())];
+    }
+    status = hipMemcpyAsync(route_indices, active_data, route_indices_bytes,
+                            hipMemcpyHostToDevice, stream);
+    if (status != hipSuccess) {
+      fprintf(stderr, "wrap_qmoe_from_file: route remap upload failed\n");
+      return -1;
+    }
+
+    std::vector<size_t> miss_order;
+    miss_order.reserve(miss_slots.size());
+    for (size_t i = 0; i < miss_slots.size(); ++i)
+      miss_order.push_back(i);
+    std::sort(miss_order.begin(), miss_order.end(), [&](size_t lhs, size_t rhs) {
+      return miss_slots[lhs] < miss_slots[rhs];
+    });
+
+    for (int i = 0; i < 4; ++i) {
+      const size_t expert_bytes = expert_sizes[i];
+      size_t begin = 0;
+      while (begin < miss_order.size()) {
+        size_t end = begin + 1;
+        while (end < miss_order.size() &&
+               miss_slots[miss_order[end]] ==
+                   miss_slots[miss_order[end - 1]] + 1)
+          ++end;
+        const size_t run_count = end - begin;
+        const size_t packed_run_bytes = run_count * expert_bytes;
+        uint8_t *packed_run = host_scratch + packed_cursor;
+        for (size_t run = 0; run < run_count; ++run) {
+          const size_t miss = miss_order[begin + run];
+          const size_t expert = static_cast<size_t>(miss_experts[miss]);
+          std::memcpy(packed_run + run * expert_bytes,
+                      static_cast<const uint8_t *>(host_tables[i]) +
+                          expert * expert_bytes,
+                      expert_bytes);
+        }
+        const size_t first_slot =
+            static_cast<size_t>(miss_slots[miss_order[begin]]);
+        status = hipMemcpyAsync(
+            static_cast<uint8_t *>(device_tables[i]) +
+                first_slot * expert_bytes,
+            packed_run, packed_run_bytes, hipMemcpyHostToDevice, stream);
+        if (status != hipSuccess) {
+          fprintf(stderr,
+                  "wrap_qmoe_from_file: compact H2D failed for constant %lld "
+                  "(%zu bytes): %s\n",
+                  (long long)indices[i], packed_run_bytes,
+                  hipGetErrorString(status));
+          return -1;
+        }
+        packed_cursor += packed_run_bytes;
+        streamed_bytes += packed_run_bytes;
+        begin = end;
+      }
+    }
+  } else {
+    for (int32_t expert : active_experts) {
+      if (expert < 0 || expert >= num_experts) {
+        fprintf(stderr,
+                "wrap_qmoe_from_file: invalid routed expert %d of %lld\n",
+                expert, (long long)num_experts);
+        return -1;
+      }
+      for (int i = 0; i < 4; ++i) {
+        const size_t expert_bytes = expert_sizes[i];
+        const size_t expert_offset = static_cast<size_t>(expert) * expert_bytes;
+        status = hipMemcpyAsync(static_cast<uint8_t *>(device_tables[i]) +
+                                    expert_offset,
+                                static_cast<const uint8_t *>(host_tables[i]) +
+                                    expert_offset,
+                                expert_bytes, hipMemcpyHostToDevice, stream);
+        if (status != hipSuccess) {
+          fprintf(stderr,
+                  "wrap_qmoe_from_file: H2D copy failed for constant %lld "
+                  "expert %d (%zu bytes): %s\n",
+                  (long long)indices[i], expert, expert_bytes,
+                  hipGetErrorString(status));
+          return -1;
+        }
+        streamed_bytes += expert_bytes;
+      }
+    }
+  }
+  RUNTIME_DEBUG_LOG(
+      "[REAL] wrap_qmoe_from_file: streamed %zu bytes for %zu active experts "
+      "across four tables (%zu cache hits, compact=%d)\n",
+      streamed_bytes, active_experts.size(), cache_hits,
+      compact_decode ? 1 : 0);
+
+  if (compact_decode) {
+    hipdnn_ep_state_set_qmoe_precomputed_routes(state, route_indices,
+                                                route_weights);
+  }
+  const int result = wrap_qmoe(
+      state, input, router_probs, router_weights, device_tables[0],
+      device_tables[1], fc1_bias, device_tables[2], device_tables[3],
+      fc2_bias, fc3_weights, fc3_scales, fc3_bias, fc1_zero_points,
+      fc2_zero_points, fc3_zero_points, output, num_tokens, hidden_size,
+      inter_size, num_experts, k, expert_weight_bits, block_size,
+      swiglu_fusion, activation_type, activation_alpha, activation_beta,
+      swiglu_limit, normalize_routing_weights, elem_size);
+  hipdnn_ep_state_set_qmoe_precomputed_routes(state, nullptr, nullptr);
+  return result;
+}
 
 int wrap_qmoe(RuntimeState *state, const void *input, const void *router_probs,
               const void *router_weights, const void *fc1_weights,
@@ -241,9 +781,25 @@ int wrap_qmoe(RuntimeState *state, const void *input, const void *router_probs,
                     "k=%lld, normalize=%lld)\n",
                     (long long)num_tokens, (long long)num_experts, (long long)k,
                     (long long)normalize_routing_weights);
-  HIP_CHECK(hip_qmoe_topk_routing(stream, router_probs, d_expert_indices,
-                                  d_expert_weights, num_tokens, num_experts, k,
-                                  normalize_routing_weights, elem_size));
+  const bool reuse_precomputed =
+      hipdnn_ep_state_get_qmoe_precomputed_indices(state) ==
+          d_expert_indices &&
+      hipdnn_ep_state_get_qmoe_precomputed_weights(state) ==
+          d_expert_weights;
+  const bool expected_precomputed =
+      hipdnn_ep_state_get_qmoe_precomputed_indices(state) != nullptr;
+  if (expected_precomputed && !reuse_precomputed) {
+    fprintf(stderr,
+            "wrap_qmoe: compact routing scratch moved unexpectedly\n");
+    return -1;
+  }
+  if (!reuse_precomputed) {
+    HIP_CHECK(hip_qmoe_topk_routing(stream, router_probs, d_expert_indices,
+                                    d_expert_weights, num_tokens, num_experts,
+                                    k, normalize_routing_weights, elem_size));
+  } else {
+    RUNTIME_DEBUG_LOG("[REAL] wrap_qmoe: reusing precomputed compact routes\n");
+  }
 
   // Fused decode fast path: single-token MoE collapses to three back-to-back
   // kernel launches (FC1+SwiGLU, FC2, weighted reduce) with zero D2H,

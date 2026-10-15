@@ -64,12 +64,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -1067,7 +1069,122 @@ struct GqaGemmCache {
 // distinct GQA layers) no longer share one descriptor map.
 struct GqaState : OpStateT<GqaState> {
   GqaGemmCache cache;
+
+  // Some ORT graphs keep the present K/V values entirely inside the compiled
+  // partition. In that case the boundary allocator legitimately supplies a
+  // null pointer for both present outputs (and, on the next decode call, for
+  // both past inputs). Keep an in-place BNSD cache in the per-layer op state
+  // so the fused GQA path can still preserve history on the GPU.
+  void *internal_key_cache = nullptr;
+  void *internal_value_cache = nullptr;
+  int64_t internal_capacity = 0;
+  int64_t internal_batch = 0;
+  int64_t internal_kv_heads = 0;
+  int64_t internal_head_dim = 0;
+  size_t internal_element_size = 0;
+
+  ~GqaState() {
+    if (internal_key_cache)
+      hipFree(internal_key_cache);
+    if (internal_value_cache)
+      hipFree(internal_value_cache);
+  }
 };
+
+static int64_t gqa_internal_cache_capacity() {
+  static const int64_t capacity = [] {
+    constexpr int64_t kDefaultCapacity = 4096;
+    const char *value = std::getenv("HIPDNN_EP_GQA_INTERNAL_CACHE_CAPACITY");
+    if (!value || !*value)
+      return kDefaultCapacity;
+    char *end = nullptr;
+    errno = 0;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed <= 0) {
+      fprintf(stderr,
+              "HIPDNN_EP_GQA_INTERNAL_CACHE_CAPACITY='%s' is invalid; using "
+              "%lld\n",
+              value, (long long)kDefaultCapacity);
+      return kDefaultCapacity;
+    }
+    return static_cast<int64_t>(parsed);
+  }();
+  return capacity;
+}
+
+static bool ensure_internal_kv_cache(GqaState *gs, int64_t batch,
+                                     int64_t kv_heads, int64_t head_dim,
+                                     size_t element_size,
+                                     int64_t required_tokens) {
+  if (!gs || batch <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      element_size == 0 || required_tokens <= 0)
+    return false;
+
+  if (gs->internal_key_cache || gs->internal_value_cache) {
+    const bool geometry_matches =
+        gs->internal_key_cache && gs->internal_value_cache &&
+        gs->internal_batch == batch && gs->internal_kv_heads == kv_heads &&
+        gs->internal_head_dim == head_dim &&
+        gs->internal_element_size == element_size;
+    if (!geometry_matches) {
+      fprintf(stderr,
+              "wrap_group_query_attention: internal KV cache geometry changed "
+              "after allocation\n");
+      return false;
+    }
+    if (required_tokens > gs->internal_capacity) {
+      fprintf(stderr,
+              "wrap_group_query_attention: internal KV cache capacity %lld "
+              "tokens is smaller than required %lld; set "
+              "HIPDNN_EP_GQA_INTERNAL_CACHE_CAPACITY before session creation\n",
+              (long long)gs->internal_capacity, (long long)required_tokens);
+      return false;
+    }
+    return true;
+  }
+
+  const int64_t capacity =
+      std::max(gqa_internal_cache_capacity(), required_tokens);
+  const uint64_t elements = static_cast<uint64_t>(batch) *
+                            static_cast<uint64_t>(kv_heads) *
+                            static_cast<uint64_t>(capacity) *
+                            static_cast<uint64_t>(head_dim);
+  if (elements > std::numeric_limits<size_t>::max() / element_size) {
+    fprintf(stderr,
+            "wrap_group_query_attention: internal KV cache size overflow\n");
+    return false;
+  }
+  const size_t bytes = static_cast<size_t>(elements) * element_size;
+  if (hipMalloc(&gs->internal_key_cache, bytes) != hipSuccess) {
+    gs->internal_key_cache = nullptr;
+    fprintf(stderr,
+            "wrap_group_query_attention: failed to allocate %zu-byte internal "
+            "key cache\n",
+            bytes);
+    return false;
+  }
+  if (hipMalloc(&gs->internal_value_cache, bytes) != hipSuccess) {
+    hipFree(gs->internal_key_cache);
+    gs->internal_key_cache = nullptr;
+    gs->internal_value_cache = nullptr;
+    fprintf(stderr,
+            "wrap_group_query_attention: failed to allocate %zu-byte internal "
+            "value cache\n",
+            bytes);
+    return false;
+  }
+  gs->internal_capacity = capacity;
+  gs->internal_batch = batch;
+  gs->internal_kv_heads = kv_heads;
+  gs->internal_head_dim = head_dim;
+  gs->internal_element_size = element_size;
+  RUNTIME_DEBUG_LOG(
+      "[REAL] GQA internal KV cache: capacity=%lld bytes_per_buffer=%zu "
+      "B=%lld G=%lld d=%lld elem=%zu\n",
+      (long long)capacity, bytes, (long long)batch, (long long)kv_heads,
+      (long long)head_dim, element_size);
+  return true;
+}
 
 // Resolve this GQA instance's descriptor cache from its op-state slot. Returns
 // nullptr when the slot is unconstructed (init failure) -- callers propagate
@@ -2879,12 +2996,6 @@ int wrap_group_query_attention(
     fprintf(stderr, "wrap_group_query_attention: qk_output not supported\n");
     return -1;
   }
-  if (!present_key || !present_value) {
-    fprintf(stderr, "wrap_group_query_attention: GQA requires "
-                    "present_key/present_value KV cache\n");
-    return -1;
-  }
-
   hipStream_t stream =
       static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state));
   if (!stream) {
@@ -2896,6 +3007,40 @@ int wrap_group_query_attention(
   // (gqa_attention_base.h: scale_ == 0.0f ? 1/sqrt(head_size) : scale_).
   if (scale == 0.0f && head_dim > 0)
     scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+  // A pair of null present pointers means the graph kept the KV state inside
+  // the compiled partition and no boundary allocation was made. Substitute a
+  // per-layer GPU cache. Its fixed sequence stride is deliberately passed to
+  // both present_seq and past_buf_seq below; valid length still comes from
+  // seqlens_k, so decode appends in place without a growing-buffer copy.
+  const bool use_internal_cache = !present_key && !present_value;
+  if ((!present_key) != (!present_value)) {
+    fprintf(stderr,
+            "wrap_group_query_attention: present_key and present_value must "
+            "either both be null or both be non-null\n");
+    return -1;
+  }
+  if (use_internal_cache) {
+    if (no_causal != 0) {
+      fprintf(stderr,
+              "wrap_group_query_attention: internal KV cache is only "
+              "supported for causal attention\n");
+      return -1;
+    }
+    GqaState *gs = GqaState::get_op_state(state, op_state_slot);
+    const size_t cache_element_size =
+        kv_quantized ? size_t{1} : static_cast<size_t>(element_size_bytes);
+    const int64_t required_tokens = std::max(seq_len_kv, seq_len_q);
+    if (!ensure_internal_kv_cache(gs, batch_size, kv_num_heads, head_dim,
+                                  cache_element_size, required_tokens))
+      return -1;
+    present_key = gs->internal_key_cache;
+    present_value = gs->internal_value_cache;
+    past_key = gs->internal_key_cache;
+    past_value = gs->internal_value_cache;
+    seq_len_kv = gs->internal_capacity;
+    past_buf_seq = gs->internal_capacity;
+  }
 
   (void)total_seq_len;      // runtime derives total_seq from seqlens_k
   (void)rotary_interleaved; // interleaved layout handled inside hip_gqa_rope

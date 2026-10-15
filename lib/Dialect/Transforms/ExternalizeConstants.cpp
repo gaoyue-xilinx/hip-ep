@@ -374,7 +374,8 @@ private:
       return failure();
     }
 
-    plan.diskResident = isDiskResidentGatherTable(plan);
+    plan.diskResident = isDiskResidentGatherTable(plan) ||
+                        isDiskResidentQMoEExpertTable(plan);
     if (plan.externalize &&
         failed(assignExternalStorage(plan, currentOffset, plannedSymbols)))
       return failure();
@@ -398,6 +399,23 @@ private:
              }
              int64_t axis = static_cast<int64_t>(gather.getAxis());
              return (axis < 0 ? axis + rank : axis) == 0;
+           });
+  }
+
+  bool isDiskResidentQMoEExpertTable(ConstantPlan &plan) const {
+    if (!skipData || !plan.externalize || plan.source != SourceKind::File)
+      return false;
+    Value result = plan.op.getResult();
+    return !result.use_empty() &&
+           llvm::all_of(result.getUses(), [&](OpOperand &use) {
+             auto qmoe = dyn_cast<hip::QMoEOp>(use.getOwner());
+             if (!qmoe)
+               return false;
+             Value operand = use.get();
+             return operand == qmoe.getFc1ExpertsWeights() ||
+                    operand == qmoe.getFc1Scales() ||
+                    operand == qmoe.getFc2ExpertsWeights() ||
+                    operand == qmoe.getFc2Scales();
            });
   }
 

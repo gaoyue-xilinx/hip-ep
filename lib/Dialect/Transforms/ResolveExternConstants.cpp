@@ -140,11 +140,20 @@ void ResolveExternConstantsPass::runOnOperation() {
       if (info.diskResident) {
         for (OpOperand &use : getGlobalOp.getResult().getUses()) {
           auto gather = dyn_cast<hip::GatherOp>(use.getOwner());
-          if (!gather || use.getOperandNumber() !=
-                             gather.getDataMutable().getOperandNumber()) {
+          auto qmoe = dyn_cast<hip::QMoEOp>(use.getOwner());
+          bool gatherData =
+              gather && use.getOperandNumber() ==
+                            gather.getDataMutable().getOperandNumber();
+          bool qmoeExpertTable =
+              qmoe && (use.get() == qmoe.getFc1ExpertsWeights() ||
+                       use.get() == qmoe.getFc1Scales() ||
+                       use.get() == qmoe.getFc2ExpertsWeights() ||
+                       use.get() == qmoe.getFc2Scales());
+          if (!gatherData && !qmoeExpertTable) {
             use.getOwner()->emitError(
-                "disk-resident constant has no GPU copy; only hip.gather data "
-                "may use it");
+                "disk-resident constant has no permanent GPU copy; only "
+                "hip.gather data or hip.qmoe expert weight/scale operands may "
+                "use it");
             return signalPassFailure();
           }
         }

@@ -10,7 +10,7 @@
 // CHECK:       hip.gather(%{{.*}}) ins(%[[T]], %{{.*}} : memref<4x8xf16>, memref<2xi64>)
 // CHECK:       hip.get_constant(%{{.*}}, %{{.*}}) : memref<4x8xf16>
 
-// ERR: error: disk-resident constant has no GPU copy; only hip.gather data may use it
+// ERR: error: disk-resident constant has no permanent GPU copy; only hip.gather data or hip.qmoe expert weight/scale operands may use it
 
 //--- gather.mlir
 module {
