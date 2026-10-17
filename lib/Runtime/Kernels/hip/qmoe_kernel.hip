@@ -1250,6 +1250,42 @@ static constexpr int kNumQmoeCfgs =
     static_cast<int>(sizeof(kQmoeCfgs) / sizeof(kQmoeCfgs[0]));
 static constexpr int kQmoeDefaultCfg = 4;  // index of {64, 8}
 
+// Qwen3.6-35B-A3B uses exactly two decode GEMV shapes.  Online tuning finds
+// the same winners consistently on gfx1151, but reaching them costs 216
+// hipEventSynchronize calls in every new process (12 candidates x 9 rounds x
+// FC1/FC2).  Keep the normal device-adaptive tuner as the default and allow
+// the validated pair to be selected explicitly for latency-sensitive runs.
+// The exact-shape checks make the switch a no-op for every other workload.
+static bool qmoe_qwen36_dp4a_preset_enabled() {
+  static const bool enabled = [] {
+#ifdef _WIN32
+    char value[8] = {};
+    const unsigned long size = GetEnvironmentVariableA(
+        "HIPDNN_EP_QMOE_QWEN36_DP4A_PRESET", value, sizeof(value));
+    return size > 0 && value[0] >= '1';
+#else
+    const char *value = getenv("HIPDNN_EP_QMOE_QWEN36_DP4A_PRESET");
+    return value && value[0] >= '1';
+#endif
+  }();
+  return enabled;
+}
+
+static bool qmoe_qwen36_dp4a_cfg(int n, int kdim, int block_size,
+                                 bool fc1, QmoeCfg *cfg) {
+  if (!cfg || !qmoe_qwen36_dp4a_preset_enabled() || block_size != 32)
+    return false;
+  if (fc1 && n == 1024 && kdim == 2048) {
+    *cfg = {64, 4};
+    return true;
+  }
+  if (!fc1 && n == 2048 && kdim == 512) {
+    *cfg = {32, 4};
+    return true;
+  }
+  return false;
+}
+
 // One round = one full sweep of all candidates (one sample each, round-robin,
 // one per decode call). First kWarmupRounds sweeps are discarded (cold start);
 // the next kSampleRounds accumulate; then best = min mean and done.
@@ -2024,7 +2060,10 @@ extern "C" int hip_qmoe_decode_fused_dp4a(
   const uint64_t key1 =
       qmoe_cfg_key(fusion_inter, static_cast<int>(hidden_size),
                    static_cast<int>(block_size), fc1_zero_points != nullptr);
-  const QmoeCfg c1 = qmoe_tune_pick(g_qmoe_fc1_dp4a_state, key1, &s1);
+  QmoeCfg c1 = {};
+  if (!qmoe_qwen36_dp4a_cfg(fusion_inter, static_cast<int>(hidden_size),
+                            static_cast<int>(block_size), true, &c1))
+    c1 = qmoe_tune_pick(g_qmoe_fc1_dp4a_state, key1, &s1);
   {
     hipEvent_t me0 = nullptr, me1 = nullptr;
     if (s1 >= 0) { hipEventCreate(&me0); hipEventCreate(&me1); hipEventRecord(me0, s); }
@@ -2070,7 +2109,11 @@ extern "C" int hip_qmoe_decode_fused_dp4a(
   const uint64_t key2 =
       qmoe_cfg_key(static_cast<int>(hidden_size), static_cast<int>(inter_size),
                    static_cast<int>(block_size), fc2_zero_points != nullptr);
-  const QmoeCfg c2 = qmoe_tune_pick(g_qmoe_fc2_dp4a_state, key2, &s2);
+  QmoeCfg c2 = {};
+  if (!qmoe_qwen36_dp4a_cfg(static_cast<int>(hidden_size),
+                            static_cast<int>(inter_size),
+                            static_cast<int>(block_size), false, &c2))
+    c2 = qmoe_tune_pick(g_qmoe_fc2_dp4a_state, key2, &s2);
   {
     hipEvent_t me0 = nullptr, me1 = nullptr;
     if (s2 >= 0) { hipEventCreate(&me0); hipEventCreate(&me1); hipEventRecord(me0, s); }
