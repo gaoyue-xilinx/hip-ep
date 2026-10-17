@@ -1384,8 +1384,17 @@ int hipdnn_ep_state_ensure_qmoe_host_scratch(RuntimeState *state,
     state->qmoe_host_scratch_size = 0;
   }
 
-  if (hipHostMalloc(&state->qmoe_host_scratch, alloc_size,
-                    hipHostMallocDefault) != hipSuccess) {
+  // QMoE decode writes large expert slices sequentially on the CPU and then
+  // consumes them through H2D DMA. Write-combined pinned memory can avoid
+  // polluting the CPU caches and improve this producer/consumer pattern, but
+  // keep it opt-in until it is validated across supported ROCm platforms.
+  const char *wc_env = std::getenv("HIPDNN_EP_QMOE_WC_STAGING");
+  const bool write_combined =
+      wc_env && *wc_env && std::strcmp(wc_env, "0") != 0;
+  const unsigned int host_flags =
+      write_combined ? hipHostMallocWriteCombined : hipHostMallocDefault;
+  if (hipHostMalloc(&state->qmoe_host_scratch, alloc_size, host_flags) !=
+      hipSuccess) {
     fprintf(stderr,
             "hipdnn_ep_state_ensure_qmoe_host_scratch: hipHostMalloc failed "
             "for %zu bytes\n",
