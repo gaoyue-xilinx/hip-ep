@@ -62,6 +62,29 @@ static size_t qmoe_expert_cache_slots() {
   return static_cast<size_t>(slots);
 }
 
+static size_t qmoe_expert_cache_slots_for_layer(size_t layer,
+                                                size_t fallback) {
+  const char *value =
+      std::getenv("HIPDNN_EP_QMOE_EXPERT_CACHE_LAYER_SLOTS");
+  if (!value || !*value)
+    return fallback;
+
+  const char *cursor = value;
+  for (size_t current = 0;; ++current) {
+    char *end = nullptr;
+    const unsigned long long slots = std::strtoull(cursor, &end, 10);
+    if (end == cursor || slots == 0 || slots > SIZE_MAX)
+      return fallback;
+    if (current == layer)
+      return static_cast<size_t>(slots);
+    if (*end == '\0')
+      return fallback;
+    if (*end != ',' || end[1] == '\0')
+      return fallback;
+    cursor = end + 1;
+  }
+}
+
 static QMoEExpertCache *get_qmoe_expert_cache(RuntimeState *state) {
   auto *cache = static_cast<QMoEExpertCache *>(
       hipdnn_ep_state_get_qmoe_expert_cache(state));
@@ -92,8 +115,10 @@ static QMoEExpertCacheEntry *find_or_create_cache_entry(
 
   constexpr size_t kTableAlignment = 256;
   const size_t min_capacity = static_cast<size_t>(minimum_slots);
+  const size_t requested_slots = qmoe_expert_cache_slots_for_layer(
+      cache->entries.size(), qmoe_expert_cache_slots());
   size_t capacity = std::min(static_cast<size_t>(num_experts),
-                             std::max(min_capacity, qmoe_expert_cache_slots()));
+                             std::max(min_capacity, requested_slots));
   size_t table_offsets[4] = {};
   size_t total_size = 0;
   auto compute_layout = [&](size_t slots) {
