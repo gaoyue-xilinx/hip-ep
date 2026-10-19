@@ -836,7 +836,7 @@ static int per_entry_load_constants(RuntimeState *state,
       }
       state->disk_constants[i] = {static_cast<const uint8_t *>(view) +
                                       file_offset,
-                                  view, view_size, c->size()};
+                                  view, view_size, c->size(), nullptr};
       disk_resident_bytes += sz;
       continue;
     }
@@ -1077,6 +1077,10 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
     free(state->gpu_constants);
   if (state->disk_constants) {
     for (size_t i = 0; i < state->num_constants; ++i) {
+      if (state->disk_constants[i].host_shadow) {
+        HIP_CLEANUP(hipHostFree(state->disk_constants[i].host_shadow));
+        state->disk_constants[i].host_shadow = nullptr;
+      }
       if (state->disk_constants[i].view) {
         unmap_file(state->disk_constants[i].view,
                    state->disk_constants[i].view_size);
@@ -1170,6 +1174,30 @@ const void *hipdnn_ep_disk_constant_get(RuntimeState *state, int64_t index,
   if (size_bytes)
     *size_bytes = static_cast<size_t>(constant.size);
   return constant.data;
+}
+
+const void *hipdnn_ep_disk_constant_get_pinned_host(RuntimeState *state,
+                                                    int64_t index,
+                                                    size_t *size_bytes) {
+  if (size_bytes)
+    *size_bytes = 0;
+  if (!state || index < 0 || static_cast<size_t>(index) >= state->num_constants ||
+      !state->disk_constants)
+    return nullptr;
+  DiskConstant &constant = state->disk_constants[index];
+  if (!constant.data || constant.size <= 0)
+    return nullptr;
+  const size_t bytes = static_cast<size_t>(constant.size);
+  if (size_bytes)
+    *size_bytes = bytes;
+  if (constant.host_shadow)
+    return constant.host_shadow;
+  void *shadow = nullptr;
+  if (hipHostMalloc(&shadow, bytes, hipHostMallocDefault) != hipSuccess)
+    return nullptr;
+  std::memcpy(shadow, constant.data, bytes);
+  constant.host_shadow = shadow;
+  return shadow;
 }
 
 static int ensure_disk_gather_staging(RuntimeState *state, size_t size) {
