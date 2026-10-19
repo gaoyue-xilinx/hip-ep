@@ -597,6 +597,11 @@ void *hipdnn_ep_constant_get(RuntimeState *state, int64_t index);
 // for a non-disk constant or invalid index. The mapping is owned by the state.
 const void *hipdnn_ep_disk_constant_get(RuntimeState *state, int64_t index,
                                         size_t *size_bytes);
+// Return a pinned host copy suitable as an asynchronous H2D source. The copy
+// is created lazily, owned by the state, and released during state cleanup.
+const void *hipdnn_ep_disk_constant_get_pinned_host(RuntimeState *state,
+                                                    int64_t index,
+                                                    size_t *size_bytes);
 
 //===----------------------------------------------------------------------===//
 // Tensor Preparation Helpers (allocation-strategy agnostic)

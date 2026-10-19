@@ -31,6 +31,7 @@ struct QMoEExpertCacheEntry {
   std::vector<size_t> last_used;
   std::vector<size_t> use_count;
   size_t tick = 0;
+  size_t layer_ordinal = 0;
 };
 
 struct QMoEExpertCache {
@@ -60,6 +61,17 @@ static size_t qmoe_expert_cache_slots() {
   if (end == value || *end != '\0' || slots == 0 || slots > SIZE_MAX)
     return 24;
   return static_cast<size_t>(slots);
+}
+
+static size_t qmoe_pinned_dma_layer_limit() {
+  const char *value = std::getenv("HIPDNN_EP_QMOE_PINNED_DMA_LAYERS");
+  if (!value || !*value)
+    return 0;
+  char *end = nullptr;
+  const unsigned long long layers = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || layers > 256)
+    return 0;
+  return static_cast<size_t>(layers);
 }
 
 static QMoEExpertCache *get_qmoe_expert_cache(RuntimeState *state) {
@@ -139,6 +151,7 @@ static QMoEExpertCacheEntry *find_or_create_cache_entry(
   entry.expert_for_slot.resize(capacity, -1);
   entry.last_used.resize(capacity, 0);
   entry.use_count.resize(capacity, 0);
+  entry.layer_ordinal = cache->entries.size();
   cache->allocated_bytes += total_size;
   cache->entries.push_back(std::move(entry));
   RUNTIME_DEBUG_LOG(
@@ -242,6 +255,22 @@ int wrap_qmoe_from_file(
           ? find_or_create_cache_entry(state, indices, expert_sizes,
                                        num_experts, k)
           : nullptr;
+
+  const void *pinned_dma_tables[4] = {};
+  bool use_pinned_dma =
+      cache_entry &&
+      cache_entry->layer_ordinal < qmoe_pinned_dma_layer_limit();
+  if (use_pinned_dma) {
+    for (int i = 0; i < 4; ++i) {
+      size_t pinned_bytes = 0;
+      pinned_dma_tables[i] = hipdnn_ep_disk_constant_get_pinned_host(
+          state, indices[i], &pinned_bytes);
+      if (!pinned_dma_tables[i] || pinned_bytes != table_sizes[i]) {
+        use_pinned_dma = false;
+        break;
+      }
+    }
+  }
 
   // Route first so file-backed tables only upload expert slices used by this
   // invocation. The regular wrapper repeats this inexpensive deterministic
@@ -469,6 +498,27 @@ int wrap_qmoe_from_file(
 
     for (int i = 0; i < 4; ++i) {
       const size_t expert_bytes = expert_sizes[i];
+      if (use_pinned_dma) {
+        for (size_t order : miss_order) {
+          const size_t expert = static_cast<size_t>(miss_experts[order]);
+          const size_t slot = static_cast<size_t>(miss_slots[order]);
+          status = hipMemcpyAsync(
+              static_cast<uint8_t *>(device_tables[i]) + slot * expert_bytes,
+              static_cast<const uint8_t *>(pinned_dma_tables[i]) +
+                  expert * expert_bytes,
+              expert_bytes, hipMemcpyHostToDevice, stream);
+          if (status != hipSuccess) {
+            fprintf(stderr,
+                    "wrap_qmoe_from_file: pinned DMA failed for constant "
+                    "%lld (%zu bytes): %s\n",
+                    (long long)indices[i], expert_bytes,
+                    hipGetErrorString(status));
+            return -1;
+          }
+          streamed_bytes += expert_bytes;
+        }
+        continue;
+      }
       size_t begin = 0;
       while (begin < miss_order.size()) {
         size_t end = begin + 1;

@@ -32,6 +32,7 @@ struct DiskConstant {
   void *view;
   size_t view_size;
   int64_t size;
+  void *host_shadow;
 };
 
 // Internal runtime state structure
