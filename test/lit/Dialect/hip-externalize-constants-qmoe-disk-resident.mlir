@@ -2,10 +2,14 @@
 // Licensed under the MIT License.
 
 // RUN: hip-mlir-opt --hip-externalize-constants='externalize-min-num-elements=1 skip-constant-data=true' %s | FileCheck %s
+// RUN: env HIPDNN_EP_QMOE_FORCE_RESIDENT=1 hip-mlir-opt --hip-externalize-constants='externalize-min-num-elements=1 skip-constant-data=true' %s | FileCheck %s --check-prefix=RESIDENT
 
 // CHECK: hipdnn.constant_offsets = array<i64: 0, 0, 0, 0>
 // CHECK: hipdnn.constant_source_kinds = array<i32: 4, 4, 4, 4>
 // CHECK-COUNT-4: hip.external_data = {disk_resident
+// RESIDENT: hipdnn.constant_offsets = array<i64: 0, 16, 32, 40>
+// RESIDENT: hipdnn.constant_source_kinds = array<i32: 2, 2, 2, 2>
+// RESIDENT-NOT: disk_resident
 
 func.func @qmoe_tables(%ctx: !hip.context, %input: tensor<1x4xf16>,
                        %router: tensor<1x2xf16>, %output: tensor<1x4xf16>)
