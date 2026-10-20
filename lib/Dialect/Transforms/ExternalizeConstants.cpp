@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -405,6 +406,15 @@ private:
   bool isDiskResidentQMoEExpertTable(ConstantPlan &plan) const {
     if (!skipData || !plan.externalize || plan.source != SourceKind::File)
       return false;
+    // File-backed QMoE experts default to paging because large models can
+    // exceed the HIP aperture. Allow callers that have checked capacity to
+    // keep compact expert tables resident and avoid per-token route readback
+    // and uploads.
+    if (const char *value = std::getenv("HIPDNN_EP_QMOE_FORCE_RESIDENT")) {
+      if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "on") == 0)
+        return false;
+    }
     Value result = plan.op.getResult();
     return !result.use_empty() &&
            llvm::all_of(result.getUses(), [&](OpOperand &use) {
